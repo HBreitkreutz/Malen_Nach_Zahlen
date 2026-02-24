@@ -33,6 +33,23 @@ def load_image(path: Path) -> np.ndarray:
     return np.asarray(image, dtype=np.uint8)
 
 
+def resize_for_processing(image: np.ndarray, max_processing_dimension: int) -> np.ndarray:
+    if max_processing_dimension <= 0:
+        return image
+
+    h, w, _ = image.shape
+    current_max = max(h, w)
+    if current_max <= max_processing_dimension:
+        return image
+
+    scale = float(max_processing_dimension) / float(current_max)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    pil = Image.fromarray(image, mode="RGB")
+    resized = pil.resize((new_w, new_h), resample=Image.LANCZOS)
+    return np.asarray(resized, dtype=np.uint8)
+
+
 def quantize_colors(image: np.ndarray, n_colors: int, random_state: int = 42) -> tuple[np.ndarray, np.ndarray]:
     h, w, _ = image.shape
     pixels = image.reshape((-1, 3)).astype(np.float32)
@@ -75,6 +92,22 @@ def quantize_colors_shape_first(
     for sp_idx in range(n_sp):
         labels[sp_labels == sp_idx] = int(sp_color_labels[sp_idx])
     return labels, palette
+
+
+def smooth_label_boundaries(labels: np.ndarray, n_labels: int, iterations: int) -> np.ndarray:
+    if iterations <= 0:
+        return labels
+
+    labels = labels.copy()
+    kernel = np.ones((3, 3), dtype=np.int16)
+    for _ in range(iterations):
+        counts = []
+        for label_idx in range(n_labels):
+            mask = (labels == label_idx).astype(np.int16)
+            counts.append(ndimage.convolve(mask, kernel, mode="nearest"))
+        stacked = np.stack(counts, axis=0)
+        labels = np.argmax(stacked, axis=0).astype(np.int32)
+    return labels
 
 
 def _choose_merge_target(
@@ -201,6 +234,99 @@ def enforce_min_region_size(
     return labels
 
 
+def _component_aspect_ratio(component_mask: np.ndarray) -> float:
+    ys, xs = np.where(component_mask)
+    if ys.size == 0:
+        return 1.0
+    h = int(ys.max() - ys.min() + 1)
+    w = int(xs.max() - xs.min() + 1)
+    short_axis = max(1, min(h, w))
+    long_axis = max(h, w)
+    return float(long_axis) / float(short_axis)
+
+
+def _component_perimeter_area_ratio(component_mask: np.ndarray, area: int) -> float:
+    if area <= 0:
+        return 0.0
+    eroded = ndimage.binary_erosion(component_mask, structure=np.ones((3, 3), dtype=bool), border_value=0)
+    boundary = component_mask & ~eroded
+    perimeter = int(boundary.sum())
+    return float(perimeter) / float(area)
+
+
+def _component_max_radius(component_mask: np.ndarray) -> float:
+    return float(np.max(ndimage.distance_transform_edt(component_mask)))
+
+
+def _is_unpaintable_component(
+    component_mask: np.ndarray,
+    area: int,
+    min_paintable_radius: float,
+    max_aspect_ratio: float,
+    max_perimeter_area_ratio: float,
+) -> bool:
+    radius = _component_max_radius(component_mask)
+    if radius >= min_paintable_radius:
+        return False
+
+    aspect_ratio = _component_aspect_ratio(component_mask)
+    perimeter_area_ratio = _component_perimeter_area_ratio(component_mask, area)
+    return aspect_ratio >= max_aspect_ratio or perimeter_area_ratio >= max_perimeter_area_ratio
+
+
+def simplify_unpaintable_regions(
+    labels: np.ndarray,
+    palette: np.ndarray,
+    min_paintable_radius: float,
+    max_aspect_ratio: float,
+    max_perimeter_area_ratio: float,
+    max_merge_region_ratio: float,
+    max_iterations: int = 8,
+) -> np.ndarray:
+    if min_paintable_radius <= 0:
+        return labels
+
+    labels = labels.copy()
+    total_pixels = labels.size
+
+    for _ in range(max_iterations):
+        changed = False
+        for color_index in range(palette.shape[0]):
+            mask = labels == color_index
+            if not mask.any():
+                continue
+
+            cc, count = ndimage.label(mask)
+            for component_id in range(1, count + 1):
+                component_mask = cc == component_id
+                area = int(component_mask.sum())
+                if area <= 0:
+                    continue
+
+                area_ratio = float(area) / float(total_pixels)
+                if area_ratio > max_merge_region_ratio:
+                    continue
+
+                if not _is_unpaintable_component(
+                    component_mask,
+                    area=area,
+                    min_paintable_radius=min_paintable_radius,
+                    max_aspect_ratio=max_aspect_ratio,
+                    max_perimeter_area_ratio=max_perimeter_area_ratio,
+                ):
+                    continue
+
+                component_color = palette[color_index].astype(np.float32)
+                target = _choose_merge_target(component_mask, labels, color_index, palette, component_color)
+                labels[component_mask] = target
+                changed = True
+
+        if not changed:
+            break
+
+    return labels
+
+
 def collect_regions(labels: np.ndarray, palette: np.ndarray) -> list[RegionInfo]:
     regions: list[RegionInfo] = []
     for color_index in range(palette.shape[0]):
@@ -235,6 +361,15 @@ def best_label_position(mask: np.ndarray) -> tuple[int, int]:
 def _mask_contours(mask: np.ndarray) -> Iterable[np.ndarray]:
     # Returns contours in (row, col) coordinates.
     return measure.find_contours(mask.astype(np.uint8), level=0.5)
+
+
+def _simplify_contour(contour: np.ndarray, tolerance: float) -> np.ndarray:
+    if tolerance <= 0 or contour.shape[0] < 4:
+        return contour
+    simplified = measure.approximate_polygon(contour, tolerance=tolerance)
+    if simplified.shape[0] < 2:
+        return contour
+    return simplified
 
 
 def _draw_contour(pdf: canvas.Canvas, contour: np.ndarray, page_height: int, y_offset: int, close_path: bool = True) -> None:
@@ -305,6 +440,7 @@ def write_pdf(
     palette: np.ndarray,
     regions: list[RegionInfo],
     extra_detail_contours: list[np.ndarray],
+    contour_simplify_tolerance: float,
     legend_columns: int = 6,
 ) -> None:
     height, width = labels.shape
@@ -326,11 +462,13 @@ def write_pdf(
     # Draw all region boundaries.
     for region in regions:
         for contour in _mask_contours(region.mask):
+            contour = _simplify_contour(contour, tolerance=contour_simplify_tolerance)
             _draw_contour(pdf, contour, page_height=page_height, y_offset=y_offset, close_path=True)
 
     # Draw edge-detail contours that are not represented by color-label boundaries.
     pdf.setLineWidth(0.35)
     for contour in extra_detail_contours:
+        contour = _simplify_contour(contour, tolerance=contour_simplify_tolerance)
         _draw_contour(pdf, contour, page_height=page_height, y_offset=y_offset, close_path=False)
     pdf.setLineWidth(0.6)
 
@@ -377,6 +515,8 @@ def build_template(
     input_path: Path,
     output_path: Path,
     n_colors: int,
+    max_processing_dimension: int,
+    boundary_smoothing_iterations: int,
     min_region_ratio: float,
     rare_color_threshold_ratio: float,
     rare_color_preserve_components: int,
@@ -386,11 +526,18 @@ def build_template(
     preserve_contrast_threshold: float,
     preserve_edge_strength_threshold: float,
     preserve_thin_structures: bool,
+    simplify_paintability: bool,
+    min_paintable_radius: float,
+    max_aspect_ratio: float,
+    max_perimeter_area_ratio: float,
+    max_paintability_merge_ratio: float,
     detail_edge_threshold: float,
     detail_min_contour_points: int,
     detail_max_contours: int,
+    contour_simplify_tolerance: float,
 ) -> None:
     image = load_image(input_path)
+    image = resize_for_processing(image, max_processing_dimension=max_processing_dimension)
     edge_strength_map = filters.sobel(skcolor.rgb2gray(image))
     if shape_first:
         labels, palette = quantize_colors_shape_first(
@@ -401,6 +548,7 @@ def build_template(
         )
     else:
         labels, palette = quantize_colors(image, n_colors=n_colors)
+    labels = smooth_label_boundaries(labels, n_labels=palette.shape[0], iterations=boundary_smoothing_iterations)
 
     min_region_pixels = int(max(1, round(image.shape[0] * image.shape[1] * min_region_ratio)))
     labels = enforce_min_region_size(
@@ -414,6 +562,15 @@ def build_template(
         preserve_edge_strength_threshold=preserve_edge_strength_threshold,
         preserve_thin_structures=preserve_thin_structures,
     )
+    if simplify_paintability:
+        labels = simplify_unpaintable_regions(
+            labels,
+            palette,
+            min_paintable_radius=min_paintable_radius,
+            max_aspect_ratio=max_aspect_ratio,
+            max_perimeter_area_ratio=max_perimeter_area_ratio,
+            max_merge_region_ratio=max_paintability_merge_ratio,
+        )
 
     regions = collect_regions(labels, palette)
     extra_detail_contours = collect_missing_detail_contours(
@@ -423,7 +580,14 @@ def build_template(
         detail_min_contour_points=detail_min_contour_points,
         detail_max_contours=detail_max_contours,
     )
-    write_pdf(output_path, labels, palette, regions, extra_detail_contours=extra_detail_contours)
+    write_pdf(
+        output_path,
+        labels,
+        palette,
+        regions,
+        extra_detail_contours=extra_detail_contours,
+        contour_simplify_tolerance=contour_simplify_tolerance,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -431,6 +595,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input_image", type=Path, help="Path to source image (png, jpeg, ...)")
     parser.add_argument("output_pdf", type=Path, help="Path to generated PDF")
     parser.add_argument("--colors", type=int, default=12, help="Number of colors in the reduced palette")
+    parser.add_argument(
+        "--max-processing-dimension",
+        type=int,
+        default=1400,
+        help="Downscale input so max(width, height) is this size before segmentation (0 disables)",
+    )
+    parser.add_argument(
+        "--boundary-smoothing-iterations",
+        type=int,
+        default=0,
+        help="How many 3x3 majority-smoothing passes to apply on label boundaries (0 disables)",
+    )
     parser.add_argument(
         "--shape-first",
         action=argparse.BooleanOptionalAction,
@@ -486,6 +662,36 @@ def parse_args() -> argparse.Namespace:
         help="Protect thin elongated regions (e.g. strings, whiskers) from merging (default: enabled)",
     )
     parser.add_argument(
+        "--simplify-paintability",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Simplify regions that are too thin/frayed to be realistically paintable (default: enabled)",
+    )
+    parser.add_argument(
+        "--min-paintable-radius",
+        type=float,
+        default=1.8,
+        help="Minimum interior radius (in pixels) for paintable regions; lower values keep thinner regions",
+    )
+    parser.add_argument(
+        "--max-aspect-ratio",
+        type=float,
+        default=6.0,
+        help="Unpaintable simplification trigger for elongated regions when thin",
+    )
+    parser.add_argument(
+        "--max-perimeter-area-ratio",
+        type=float,
+        default=1.3,
+        help="Unpaintable simplification trigger for very frayed/thin boundaries when thin",
+    )
+    parser.add_argument(
+        "--max-paintability-merge-ratio",
+        type=float,
+        default=0.04,
+        help="Do not simplify very large regions above this area ratio",
+    )
+    parser.add_argument(
         "--detail-edge-threshold",
         type=float,
         default=0.085,
@@ -503,6 +709,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Maximum number of additional detail contours to draw (0 = unlimited)",
     )
+    parser.add_argument(
+        "--contour-simplify-tolerance",
+        type=float,
+        default=1.4,
+        help="Douglas-Peucker tolerance in pixels for smoothing drawn contours (0 disables)",
+    )
     return parser.parse_args()
 
 
@@ -511,6 +723,10 @@ def main() -> None:
 
     if args.colors < 2:
         raise ValueError("--colors must be >= 2")
+    if args.max_processing_dimension < 0:
+        raise ValueError("--max-processing-dimension must be >= 0")
+    if args.boundary_smoothing_iterations < 0:
+        raise ValueError("--boundary-smoothing-iterations must be >= 0")
     if not (0 < args.min_region_ratio < 1):
         raise ValueError("--min-region-ratio must be between 0 and 1")
 
@@ -526,17 +742,29 @@ def main() -> None:
         raise ValueError("--preserve-contrast-threshold must be >= 0")
     if args.preserve_edge_strength_threshold < 0:
         raise ValueError("--preserve-edge-strength-threshold must be >= 0")
+    if args.min_paintable_radius < 0:
+        raise ValueError("--min-paintable-radius must be >= 0")
+    if args.max_aspect_ratio < 1:
+        raise ValueError("--max-aspect-ratio must be >= 1")
+    if args.max_perimeter_area_ratio < 0:
+        raise ValueError("--max-perimeter-area-ratio must be >= 0")
+    if not (0 <= args.max_paintability_merge_ratio <= 1):
+        raise ValueError("--max-paintability-merge-ratio must be between 0 and 1")
     if args.detail_edge_threshold < 0:
         raise ValueError("--detail-edge-threshold must be >= 0")
     if args.detail_min_contour_points < 2:
         raise ValueError("--detail-min-contour-points must be >= 2")
     if args.detail_max_contours < 0:
         raise ValueError("--detail-max-contours must be >= 0")
+    if args.contour_simplify_tolerance < 0:
+        raise ValueError("--contour-simplify-tolerance must be >= 0")
 
     build_template(
         args.input_image,
         args.output_pdf,
         args.colors,
+        args.max_processing_dimension,
+        args.boundary_smoothing_iterations,
         args.min_region_ratio,
         rare_color_threshold_ratio=args.rare_color_threshold_ratio,
         rare_color_preserve_components=args.rare_color_preserve_components,
@@ -546,9 +774,15 @@ def main() -> None:
         preserve_contrast_threshold=args.preserve_contrast_threshold,
         preserve_edge_strength_threshold=args.preserve_edge_strength_threshold,
         preserve_thin_structures=args.preserve_thin_structures,
+        simplify_paintability=args.simplify_paintability,
+        min_paintable_radius=args.min_paintable_radius,
+        max_aspect_ratio=args.max_aspect_ratio,
+        max_perimeter_area_ratio=args.max_perimeter_area_ratio,
+        max_paintability_merge_ratio=args.max_paintability_merge_ratio,
         detail_edge_threshold=args.detail_edge_threshold,
         detail_min_contour_points=args.detail_min_contour_points,
         detail_max_contours=args.detail_max_contours,
+        contour_simplify_tolerance=args.contour_simplify_tolerance,
     )
 
 
