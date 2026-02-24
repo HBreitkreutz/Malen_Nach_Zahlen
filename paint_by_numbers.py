@@ -66,9 +66,12 @@ def enforce_min_region_size(
     labels: np.ndarray,
     palette: np.ndarray,
     min_region_pixels: int,
+    rare_color_threshold_ratio: float,
+    rare_color_preserve_components: int,
     max_iterations: int = 15,
 ) -> np.ndarray:
     labels = labels.copy()
+    total_pixels = labels.size
 
     for _ in range(max_iterations):
         changed = False
@@ -78,9 +81,21 @@ def enforce_min_region_size(
                 continue
 
             cc, count = ndimage.label(mask)
+            component_areas = np.bincount(cc.ravel())[1:]
+            preserved_components: set[int] = set()
+
+            color_ratio = float(mask.sum()) / float(total_pixels)
+            if rare_color_preserve_components > 0 and color_ratio <= rare_color_threshold_ratio:
+                keep = min(rare_color_preserve_components, component_areas.size)
+                if keep > 0:
+                    largest_ids = np.argsort(component_areas)[-keep:] + 1
+                    preserved_components = set(int(i) for i in largest_ids)
+
             for component_id in range(1, count + 1):
                 component_mask = cc == component_id
                 area = int(component_mask.sum())
+                if component_id in preserved_components:
+                    continue
                 if area >= min_region_pixels:
                     continue
 
@@ -222,12 +237,25 @@ def write_pdf(
     pdf.save()
 
 
-def build_template(input_path: Path, output_path: Path, n_colors: int, min_region_ratio: float) -> None:
+def build_template(
+    input_path: Path,
+    output_path: Path,
+    n_colors: int,
+    min_region_ratio: float,
+    rare_color_threshold_ratio: float,
+    rare_color_preserve_components: int,
+) -> None:
     image = load_image(input_path)
     labels, palette = quantize_colors(image, n_colors=n_colors)
 
     min_region_pixels = int(max(1, round(image.shape[0] * image.shape[1] * min_region_ratio)))
-    labels = enforce_min_region_size(labels, palette, min_region_pixels=min_region_pixels)
+    labels = enforce_min_region_size(
+        labels,
+        palette,
+        min_region_pixels=min_region_pixels,
+        rare_color_threshold_ratio=rare_color_threshold_ratio,
+        rare_color_preserve_components=rare_color_preserve_components,
+    )
 
     regions = collect_regions(labels, palette)
     write_pdf(output_path, labels, palette, regions)
@@ -244,6 +272,18 @@ def parse_args() -> argparse.Namespace:
         default=0.005,
         help="Minimum region area as ratio of full image area (e.g. 0.005 = 0.5%%)",
     )
+    parser.add_argument(
+        "--rare-color-threshold-ratio",
+        type=float,
+        default=0.02,
+        help="Colors that cover less than this ratio are treated as rare (default: 0.02 = 2%%)",
+    )
+    parser.add_argument(
+        "--rare-color-preserve-components",
+        type=int,
+        default=2,
+        help="For rare colors, preserve this many largest regions from merging",
+    )
     return parser.parse_args()
 
 
@@ -255,7 +295,19 @@ def main() -> None:
     if not (0 < args.min_region_ratio < 1):
         raise ValueError("--min-region-ratio must be between 0 and 1")
 
-    build_template(args.input_image, args.output_pdf, args.colors, args.min_region_ratio)
+    if not (0 <= args.rare_color_threshold_ratio < 1):
+        raise ValueError("--rare-color-threshold-ratio must be between 0 (inclusive) and 1")
+    if args.rare_color_preserve_components < 0:
+        raise ValueError("--rare-color-preserve-components must be >= 0")
+
+    build_template(
+        args.input_image,
+        args.output_pdf,
+        args.colors,
+        args.min_region_ratio,
+        rare_color_threshold_ratio=args.rare_color_threshold_ratio,
+        rare_color_preserve_components=args.rare_color_preserve_components,
+    )
 
 
 if __name__ == "__main__":
