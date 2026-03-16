@@ -1,6 +1,6 @@
-# Malen_Nach_Zahlen
+# Paint by numbers
 
-Python-Tool, um aus einem beliebigen Bild eine druckbare **Malen-nach-Zahlen**-Vorlage als PDF zu erzeugen.
+Python-Tool, um aus einem beliebigen Bild eine druckbare **Paint by numbers**-Vorlage als PDF zu erzeugen (ausmalen von Flächen anhand vordefinierter Zahlen, die jeweils einer Farbe zugeordnet sind).
 
 ## Features
 
